@@ -278,4 +278,4 @@ HTTP 200
 
 ## Uso de IA
 
-Implementação, testes e README escritos com Claude Code (IA da Anthropic) a partir do enunciado. O que eu revisei: _(a preencher)_
+Implementação, testes e README escritos com Claude Code (IA da Anthropic) a partir do enunciado. Coordenei o trabalho junto com a IA: pedi que cada entrega fosse revisada item a item contra as seções O que fazer, Entrega e Como avaliamos do enunciado, e acompanhei as correções que saíram dessa revisão. Nessa revisão, os agentes de auditoria apontaram que faltava timeout de verdade e que não dava para saber quando um post sem mudança tinha sido conferido; os dois pontos foram corrigidos (prazo por chamada ao provedor e `last_checked_at`). O que eu revisei: rodei os testes (45/45) e o typecheck, ambos limpos. Conferi os testes de janelas sobrepostas, de retry com limite e de 429 com `Retry-After` usando relógio controlado. Revisei a decisão de encerrar o sync como `rate_limited` quando o `Retry-After` passa do teto de 60 s, em vez de esperar.
