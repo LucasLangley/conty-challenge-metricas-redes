@@ -2,6 +2,7 @@ import { serve } from "@hono/node-server";
 import { createApp } from "./app.ts";
 import { systemClock } from "./clock.ts";
 import { defaultRetryPolicy } from "./domain/retry.ts";
+import { DEFAULT_REQUEST_TIMEOUT_MS } from "./domain/sync.ts";
 import { FakeProvider } from "./providers/fake.ts";
 import type { RawPost } from "./providers/http-response.ts";
 import { MemoryStore } from "./store.ts";
@@ -39,6 +40,7 @@ const app = createApp({
   clock: systemClock,
   retry: defaultRetryPolicy,
   maxPages: 100,
+  requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
   defaultWindowDays: 7,
 });
 const port = Number(process.env.PORT ?? 3004);

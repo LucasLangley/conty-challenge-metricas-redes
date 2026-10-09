@@ -18,6 +18,8 @@ export type Connection = {
 };
 
 // Valor absoluto mais recente do post. A chave natural é provider + postId.
+// `fetchedAt` é quando chegou o valor atual (o do snapshot vigente);
+// `lastCheckedAt` é a última vez que o provedor mandou o post, mesmo sem mudança.
 export type Post = MetricValues & {
   provider: ProviderName;
   postId: string;
@@ -25,6 +27,8 @@ export type Post = MetricValues & {
   connectionId: string;
   publishedAt: string;
   fetchedAt: Date;
+  lastCheckedAt: Date;
+  lastCheckedSyncRunId: string;
 };
 
 export type Snapshot = MetricValues & {

@@ -21,12 +21,19 @@ function setup() {
   };
   const instagram = new FakeProvider(clock, [], catalog);
   const youtube = new FakeProvider(clock, [{ status: 429, headers: { "Retry-After": "3600" } }]);
+  // TikTok não responde nas 3 primeiras chamadas; depois responde do catálogo.
+  const tiktok = new FakeProvider(
+    clock,
+    Array.from({ length: 3 }, () => ({ timeout: true }) as const),
+    { pageSize: 2, postsByAccount: { tt_ana: [catalog.postsByAccount.ig_ana![2]!] } },
+  );
   const app = createApp({
     store: new MemoryStore(),
-    providers: { instagram, youtube },
+    providers: { instagram, youtube, tiktok },
     clock,
     retry: { maxAttempts: 3, baseDelayMs: 1_000, maxBackoffMs: 10_000, maxRetryAfterMs: 60_000 },
     maxPages: 20,
+    requestTimeoutMs: 5_000,
     defaultWindowDays: 7,
   });
   return { app, clock, instagram };
@@ -80,7 +87,7 @@ describe("POST /connections", () => {
 });
 
 describe("sync pela API", () => {
-  it("janelas sobrepostas não duplicam e as métricas mostram fetched_at", async () => {
+  it("janelas sobrepostas não duplicam e as métricas mostram fetched_at e last_checked_at", async () => {
     const { app, clock } = setup();
     const { body: conn } = await connect(app);
 
@@ -99,14 +106,17 @@ describe("sync pela API", () => {
     expect(second.body).toMatchObject({ status: "succeeded", posts_created: 1, posts_unchanged: 1 });
 
     const posts = await get(app, "/creators/cr_ana/posts");
-    expect(posts.body.posts.map((p: Json) => [p.post_id, p.views, p.fetched_at])).toEqual([
-      ["c", 300, "2026-10-09T12:30:00.000Z"],
-      ["b", 200, "2026-10-09T12:00:00.000Z"],
-      ["a", 100, "2026-10-09T12:00:00.000Z"],
+    expect(
+      posts.body.posts.map((p: Json) => [p.post_id, p.views, p.fetched_at, p.last_checked_at, p.last_checked_sync_run_id]),
+    ).toEqual([
+      ["c", 300, "2026-10-09T12:30:00.000Z", "2026-10-09T12:30:00.000Z", second.body.id],
+      ["b", 200, "2026-10-09T12:00:00.000Z", "2026-10-09T12:30:00.000Z", second.body.id],
+      ["a", 100, "2026-10-09T12:00:00.000Z", "2026-10-09T12:00:00.000Z", first.body.id],
     ]);
 
     const history = await get(app, "/posts/instagram/b/snapshots");
     expect(history.body.snapshots).toHaveLength(1);
+    expect(history.body).toMatchObject({ fetched_at: "2026-10-09T12:00:00.000Z", last_checked_at: "2026-10-09T12:30:00.000Z" });
 
     const connection = await get(app, `/connections/${conn.id}`);
     expect(connection.body.last_synced_at).toBe("2026-10-09T12:30:00.000Z");
@@ -133,6 +143,23 @@ describe("sync pela API", () => {
     expect(res.body).toMatchObject({ status: "rate_limited", retry_after_at: "2026-10-09T13:00:00.000Z" });
     const runs = await get(app, `/connections/${conn.id}/sync-runs`);
     expect(runs.body.runs[0].status).toBe("rate_limited");
+  });
+
+  it("provedor que não responde: 502 por timeout, e a sync seguinte não recebe 409", async () => {
+    const { app } = setup();
+    const { body: conn } = await connect(app, "tiktok", "tt_ana");
+
+    const timedOut = await post(app, `/connections/${conn.id}/sync`);
+    expect(timedOut.status).toBe(502);
+    expect(timedOut.body).toMatchObject({ status: "failed", requests: 3 });
+    expect(timedOut.body.error).toContain("não respondeu em 5s (timeout)");
+
+    const next = await post(app, `/connections/${conn.id}/sync`);
+    expect(next.status).toBe(200);
+    expect(next.body).toMatchObject({ status: "succeeded", posts_created: 1 });
+
+    const runs = await get(app, `/connections/${conn.id}/sync-runs`);
+    expect(runs.body.runs.map((r: Json) => r.status)).toEqual(["succeeded", "failed"]);
   });
 
   it("janela inválida e conexão inexistente", async () => {

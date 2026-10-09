@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Connection } from "../src/domain/metrics.ts";
-import { type MetricsProvider, ProviderError } from "../src/domain/provider.ts";
+import { type MetricsProvider, type PostPage, ProviderError } from "../src/domain/provider.ts";
 import type { RetryPolicy } from "../src/domain/retry.ts";
 import { type SyncDeps, SyncInProgressError, syncConnection } from "../src/domain/sync.ts";
 import { type FakeCatalog, FakeProvider, type ScriptStep } from "../src/providers/fake.ts";
@@ -105,6 +105,8 @@ describe("idempotência: o mesmo post não conta duas vezes", () => {
     expect(totalViews(store)).toBe(1000);
     for (const id of ["a", "b", "c", "d"]) expect(store.listSnapshots("instagram", id)).toHaveLength(1);
     expect(store.getPost("instagram", "b")!.fetchedAt.toISOString()).toBe(firstFetch);
+    expect(store.getPost("instagram", "b")!.lastCheckedSyncRunId).toBe(second.id);
+    expect(store.getPost("instagram", "a")!.lastCheckedSyncRunId).toBe(first.id);
   });
 
   it("no trecho comum, número novo substitui o anterior em vez de somar", async () => {
@@ -126,15 +128,21 @@ describe("idempotência: o mesmo post não conta duas vezes", () => {
     expect(store.listSnapshots("instagram", "b").map((s) => s.views)).toEqual([200, 260]);
   });
 
-  it("sync repetida com os mesmos números não grava nada", async () => {
+  it("sync repetida com os mesmos números não cria snapshot, mas registra que o post foi conferido", async () => {
     const { store, clock, sync } = setup([page([raw("p1", 100)]), page([raw("p1", 100)])]);
-    await sync();
+    const first = await sync();
+    expect(store.getPost("instagram", "p1")).toMatchObject({ lastCheckedAt: new Date(START), lastCheckedSyncRunId: first.id });
+
     clock.advance(5 * 60 * 1000);
     const again = await sync();
 
     expect(again).toMatchObject({ postsReceived: 1, postsCreated: 0, postsUpdated: 0, postsUnchanged: 1 });
     expect(store.listSnapshots("instagram", "p1")).toHaveLength(1);
-    expect(store.getPost("instagram", "p1")!.fetchedAt.toISOString()).toBe(START);
+    const post = store.getPost("instagram", "p1")!;
+    expect(post.views).toBe(100);
+    expect(post.fetchedAt.toISOString()).toBe(START);
+    expect(post.lastCheckedAt.toISOString()).toBe("2026-10-09T12:05:00.000Z");
+    expect(post.lastCheckedSyncRunId).toBe(again.id);
   });
 });
 
@@ -144,6 +152,7 @@ describe("falha transitória: retry com teto e backoff", () => {
     const run = await sync();
 
     expect(run).toMatchObject({ status: "succeeded", requests: 3, waitedMs: 3_000 });
+    expect(clock.expired).toEqual([10_000]);
     expect(clock.sleeps).toEqual([1_000, 2_000]);
     expect(store.getPost("instagram", "p1")!.views).toBe(100);
   });
@@ -188,6 +197,95 @@ describe("falha transitória: retry com teto e backoff", () => {
     const retry = await sync();
     expect(retry).toMatchObject({ status: "succeeded", postsCreated: 1, postsUnchanged: 1 });
     expect(totalViews(store)).toBe(120);
+  });
+});
+
+describe("timeout de verdade: provedor que não responde", () => {
+  function hangingProvider() {
+    const signals: AbortSignal[] = [];
+    // Pior caso: ignora o signal e nunca resolve.
+    const provider: MetricsProvider = {
+      listPosts(_request, signal) {
+        signals.push(signal);
+        return new Promise<never>(() => {});
+      },
+    };
+    return { provider, signals };
+  }
+
+  it("cada chamada vence o prazo, entra no retry com teto e a sync fecha como failed", async () => {
+    const { deps, store, clock } = setup();
+    const { provider, signals } = hangingProvider();
+    const run = await syncConnection(
+      { ...deps, providers: { instagram: provider }, requestTimeoutMs: 5_000 },
+      store.getConnection("conn_1")!,
+      WINDOW,
+    );
+
+    expect(run).toMatchObject({ status: "failed", requests: 4, pages: 0, waitedMs: 7_000 });
+    expect(run.error).toContain("não respondeu em 5s (timeout)");
+    expect(run.error).toContain("4 tentativa");
+    expect(clock.expired).toEqual([5_000, 5_000, 5_000, 5_000]);
+    expect(clock.sleeps).toEqual([1_000, 2_000, 4_000]);
+    expect(run.finishedAt!.toISOString()).toBe("2026-10-09T12:00:27.000Z");
+    expect(store.listSyncRuns("conn_1")[0]).toMatchObject({ id: run.id, status: "failed" });
+    expect(store.getConnection("conn_1")!.lastSyncedAt).toBeNull();
+
+    // O provedor recebeu o aviso de que cada chamada foi abandonada.
+    expect(signals).toHaveLength(4);
+    for (const signal of signals) {
+      expect(signal.aborted).toBe(true);
+      expect(signal.reason).toBeInstanceOf(ProviderError);
+    }
+  });
+
+  it("depois do timeout, a próxima sync da mesma conexão roda (sem SyncInProgressError)", async () => {
+    const { deps, store, sync, provider: fake } = setup();
+    const { provider } = hangingProvider();
+    const failed = await syncConnection({ ...deps, providers: { instagram: provider } }, store.getConnection("conn_1")!, WINDOW);
+    expect(failed.status).toBe("failed");
+
+    fake.enqueue(page([raw("p1", 100)]));
+    const next = await sync();
+    expect(next.status).toBe("succeeded");
+    expect(store.getPost("instagram", "p1")!.views).toBe(100);
+  });
+
+  it("resposta que chega depois do prazo é ignorada", async () => {
+    const { deps, store } = setup();
+    let lateAnswer: ((page: PostPage) => void) | null = null;
+    let calls = 0;
+    const provider: MetricsProvider = {
+      async listPosts() {
+        calls += 1;
+        if (calls === 1) return new Promise<PostPage>((resolve) => (lateAnswer = resolve));
+        lateAnswer!({ posts: [{ postId: "late", publishedAt: "2026-10-02T00:00:00.000Z", views: 1, likes: 0, comments: 0 }], nextCursor: null });
+        return { posts: [{ postId: "p1", publishedAt: "2026-10-02T00:00:00.000Z", views: 9, likes: 1, comments: 0 }], nextCursor: null };
+      },
+    };
+    const run = await syncConnection({ ...deps, providers: { instagram: provider } }, store.getConnection("conn_1")!, WINDOW);
+
+    expect(run).toMatchObject({ status: "succeeded", requests: 2, postsReceived: 1 });
+    expect(store.listPostsByCreator("cr_ana").map((p) => p.postId)).toEqual(["p1"]);
+  });
+
+  it("exceção inesperada fecha a sync como failed com o motivo e libera a próxima", async () => {
+    const { deps, store, sync, provider: fake } = setup();
+    const broken: MetricsProvider = {
+      async listPosts() {
+        throw new TypeError("bug no adaptador");
+      },
+    };
+    await expect(
+      syncConnection({ ...deps, providers: { instagram: broken } }, store.getConnection("conn_1")!, WINDOW),
+    ).rejects.toThrow("bug no adaptador");
+
+    const [closed] = store.listSyncRuns("conn_1");
+    expect(closed).toMatchObject({ status: "failed", error: "bug no adaptador" });
+    expect(closed!.finishedAt).not.toBeNull();
+
+    fake.enqueue(page([]));
+    expect((await sync()).status).toBe("succeeded");
   });
 });
 

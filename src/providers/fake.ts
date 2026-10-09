@@ -1,8 +1,16 @@
 import type { Clock } from "../clock.ts";
-import { type ListPostsRequest, type MetricsProvider, type PostPage, ProviderError } from "../domain/provider.ts";
+import type { ListPostsRequest, MetricsProvider, PostPage } from "../domain/provider.ts";
 import { type HttpLikeResponse, type RawPost, toPostPage } from "./http-response.ts";
 
+// `{ timeout: true }` é um provedor que não responde: a chamada fica pendurada
+// até o prazo da sync abortar o signal.
 export type ScriptStep = HttpLikeResponse | { timeout: true };
+
+function hang(signal: AbortSignal | undefined): Promise<never> {
+  return new Promise((_, reject) => {
+    signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+}
 
 export type FakeCatalog = { postsByAccount: Record<string, RawPost[]>; pageSize: number };
 
@@ -29,10 +37,10 @@ export class FakeProvider implements MetricsProvider {
     return this.script.length;
   }
 
-  async listPosts(request: ListPostsRequest): Promise<PostPage> {
+  async listPosts(request: ListPostsRequest, signal?: AbortSignal): Promise<PostPage> {
     this.calls.push({ ...request });
     const step = this.script.shift() ?? this.fromCatalog(request);
-    if ("timeout" in step) throw new ProviderError("transient", "provedor não respondeu no prazo (timeout)");
+    if ("timeout" in step) return hang(signal);
     return toPostPage(step, this.clock.now());
   }
 

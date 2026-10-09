@@ -10,12 +10,16 @@ import {
 } from "./provider.ts";
 import { type RetryPolicy, decideRetry } from "./retry.ts";
 
+export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+
 export type SyncDeps = {
   store: Store;
   providers: Partial<Record<ProviderName, MetricsProvider>>;
   clock: Clock;
   retry: RetryPolicy;
   maxPages: number;
+  // Prazo de cada chamada ao provedor. Padrão: DEFAULT_REQUEST_TIMEOUT_MS.
+  requestTimeoutMs?: number;
 };
 
 export type SyncWindow = { since: Date; until: Date };
@@ -90,11 +94,19 @@ export async function syncConnection(deps: SyncDeps, connection: Connection, win
     if (err instanceof ProviderError && err.retryAfterMs !== null) {
       run.retryAfterAt = new Date(run.finishedAt.getTime() + err.retryAfterMs);
     }
-    store.updateSyncRun(run);
+    // Erro inesperado (bug, store fora do ar) sobe para quem chamou, mas a
+    // execução já fica fechada como failed pelo finally.
     if (!(err instanceof ProviderError)) throw err;
-    return run;
+  } finally {
+    // Uma sync nunca termina como running: se algo escapou de tudo acima, ela
+    // fecha como failed e a próxima sync da conexão não recebe 409.
+    if (run.status === "running") {
+      run.status = "failed";
+      run.finishedAt ??= clock.now();
+      run.error ??= "sync interrompida por erro inesperado";
+    }
+    store.updateSyncRun(run);
   }
-  store.updateSyncRun(run);
   return run;
 }
 
@@ -104,10 +116,11 @@ async function fetchPage(
   run: SyncRun,
   request: ListPostsRequest,
 ): Promise<PostPage> {
+  const timeoutMs = deps.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   for (let attempt = 1; ; attempt++) {
     run.requests += 1;
     try {
-      return await provider.listPosts(request);
+      return await withDeadline(deps.clock, timeoutMs, (signal) => provider.listPosts(request, signal));
     } catch (err) {
       if (!(err instanceof ProviderError)) throw err;
       const decision = decideRetry(err, attempt, deps.retry);
@@ -124,15 +137,33 @@ async function fetchPage(
   }
 }
 
+// Cada chamada ao provedor tem prazo. Se o prazo vence primeiro, a chamada vira
+// falha transitória (entra no mesmo retry com teto) e o signal é abortado para o
+// provedor largar a requisição. Uma resposta que chegue depois é ignorada.
+function withDeadline<T>(clock: Clock, timeoutMs: number, call: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  return new Promise<T>((resolve, reject) => {
+    void clock.timeout(timeoutMs, controller.signal).then(() => {
+      const error = new ProviderError("transient", `provedor não respondeu em ${timeoutMs / 1000}s (timeout)`);
+      reject(error);
+      controller.abort(error);
+    });
+    call(controller.signal).then(resolve, reject);
+  }).finally(() => controller.abort());
+}
+
 // O mesmo post pode chegar várias vezes: repetido na página, em outra página
 // ou numa janela que se sobrepõe à anterior. A chave é provider + postId, e o
 // valor guardado é sempre o absoluto mais recente; um snapshot só entra no
-// histórico quando os números mudaram.
+// histórico quando os números mudaram. Mesmo sem mudança, o post registra que
+// foi conferido agora (lastCheckedAt), para não parecer dado velho.
 function applyPost(store: Store, connection: Connection, run: SyncRun, item: ProviderPost, fetchedAt: Date): void {
   run.postsReceived += 1;
   const current = store.getPost(connection.provider, item.postId);
   const decision = decideSnapshot(current, item);
+  const checked = { lastCheckedAt: fetchedAt, lastCheckedSyncRunId: run.id };
   if (decision === "unchanged") {
+    store.savePost({ ...current!, ...checked });
     run.postsUnchanged += 1;
     return;
   }
@@ -145,6 +176,7 @@ function applyPost(store: Store, connection: Connection, run: SyncRun, item: Pro
     publishedAt: item.publishedAt,
     ...values,
     fetchedAt,
+    ...checked,
   });
   store.appendSnapshot({ provider: connection.provider, postId: item.postId, ...values, fetchedAt, syncRunId: run.id });
   if (decision === "created") run.postsCreated += 1;

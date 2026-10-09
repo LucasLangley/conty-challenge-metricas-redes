@@ -49,6 +49,8 @@ function postJson(p: Post) {
     likes: p.likes,
     comments: p.comments,
     fetched_at: iso(p.fetchedAt),
+    last_checked_at: iso(p.lastCheckedAt),
+    last_checked_sync_run_id: p.lastCheckedSyncRunId,
   };
 }
 
